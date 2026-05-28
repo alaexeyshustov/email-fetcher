@@ -399,3 +399,85 @@ func TestGetAttachmentContent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("pdf data"), resp.GetContent().GetContent())
 }
+
+// --- Composite cursor round-trip ---
+
+func TestListEmails_compositeCursorRoundTrip(t *testing.T) {
+	// Page 1: provider returns NextPageToken "p2".
+	// Page 2: provider must receive "p2" decoded from the composite cursor.
+	var receivedOnPage2 string
+	fake := &fakeProvider{
+		name: "gmail",
+		listEmailsFn: func(_ context.Context, _ string, _ emailv1.EmailFormat, _ int32, pageToken string, _ []string) ([]*emailv1.Email, *emailv1.PageInfo, error) {
+			if pageToken == "" {
+				return []*emailv1.Email{{Id: "gmail/1"}}, &emailv1.PageInfo{NextPageToken: "p2", ResultCount: 1}, nil
+			}
+			receivedOnPage2 = pageToken
+			return []*emailv1.Email{{Id: "gmail/2"}}, &emailv1.PageInfo{ResultCount: 1}, nil
+		},
+	}
+	client := setupServer(t, map[emailv1.Provider]provider.Provider{
+		emailv1.Provider_GMAIL: fake,
+	})
+
+	stream1, err := client.ListEmails(context.Background(), &emailv1.ListEmailsRequest{
+		Credentials: []*emailv1.ProviderCredentials{{Provider: emailv1.Provider_GMAIL, AccessToken: "tok"}},
+	})
+	require.NoError(t, err)
+	_, page1 := drainList(t, stream1)
+	require.NotEmpty(t, page1.GetNextPageToken(), "page 1 must carry a next_page_token")
+
+	stream2, err := client.ListEmails(context.Background(), &emailv1.ListEmailsRequest{
+		Credentials: []*emailv1.ProviderCredentials{{Provider: emailv1.Provider_GMAIL, AccessToken: "tok"}},
+		PageToken:   page1.GetNextPageToken(),
+	})
+	require.NoError(t, err)
+	emails2, _ := drainList(t, stream2)
+
+	require.Len(t, emails2, 1)
+	assert.Equal(t, "gmail/2", emails2[0].GetId())
+	assert.Equal(t, "p2", receivedOnPage2)
+}
+
+// --- UNAUTHENTICATED propagation ---
+
+func TestGetEmail_unauthenticated(t *testing.T) {
+	fake := &fakeProvider{
+		name: "gmail",
+		getEmailFn: func(_ context.Context, _ string, _ string, _ emailv1.EmailFormat) (*emailv1.Email, error) {
+			return nil, status.Errorf(codes.Unauthenticated, "token expired")
+		},
+	}
+	client := setupServer(t, map[emailv1.Provider]provider.Provider{
+		emailv1.Provider_GMAIL: fake,
+	})
+
+	_, err := client.GetEmail(context.Background(), &emailv1.GetEmailRequest{
+		Credentials: &emailv1.ProviderCredentials{Provider: emailv1.Provider_GMAIL, AccessToken: "expired"},
+		Id:          "INBOX/1",
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
+func TestListEmails_unauthenticatedInTrailingMetadata(t *testing.T) {
+	fake := &fakeProvider{
+		name: "gmail",
+		listEmailsFn: func(_ context.Context, _ string, _ emailv1.EmailFormat, _ int32, _ string, _ []string) ([]*emailv1.Email, *emailv1.PageInfo, error) {
+			return nil, nil, status.Errorf(codes.Unauthenticated, "token expired")
+		},
+	}
+	client := setupServer(t, map[emailv1.Provider]provider.Provider{
+		emailv1.Provider_GMAIL: fake,
+	})
+
+	var trailer metadata.MD
+	stream, err := client.ListEmails(context.Background(), &emailv1.ListEmailsRequest{
+		Credentials: []*emailv1.ProviderCredentials{{Provider: emailv1.Provider_GMAIL, AccessToken: "expired"}},
+	}, grpc.Trailer(&trailer))
+	require.NoError(t, err)
+
+	_, page := drainList(t, stream)
+	assert.Equal(t, int32(0), page.GetResultCount())
+	assert.Equal(t, []string{"gmail"}, trailer.Get("x-failed-providers"))
+}
