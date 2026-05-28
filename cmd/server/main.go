@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net"
 	"os"
@@ -18,13 +19,23 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	log.Printf("email-fetcher listening on %s (env=%s log=%s)", lis.Addr(), cfg.Env, cfg.LogLevel)
+	// grpc.NewServer() and EmailServiceServer registration wired here
+	// once proto/email/v1 code generation is complete.
 
-	// gRPC server registration is wired here once proto generation is complete.
+	log.Printf("email-fetcher listening on %s (env=%s log=%s)", lis.Addr(), cfg.Env, cfg.LogLevel)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("email-fetcher shutting down")
+	log.Printf("email-fetcher shutting down (timeout=%s)", cfg.ShutdownTimeout)
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+
+	// srv.GracefulStop() blocks until active RPCs complete or ctx expires,
+	// preventing indefinite hangs during rolling deploys.
+	_ = ctx // removed once grpc.Server is wired
+
+	log.Println("email-fetcher stopped")
 }

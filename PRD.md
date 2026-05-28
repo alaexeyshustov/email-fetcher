@@ -92,17 +92,19 @@ The full IDL lives in `proto/email/v1/email.proto`. Generated Go code is committ
 | `GetLabels` | Unary | `GetLabelsRequest` | `GetLabelsResponse` | Returns all labels (system and user-defined) for a mailbox. |
 | `GetUnreadCount` | Unary | `GetUnreadCountRequest` | `GetUnreadCountResponse` | Returns the count of unread messages, optionally scoped to a label. |
 | `ModifyLabels` | Unary | `ModifyLabelsRequest` | `ModifyLabelsResponse` | Atomically adds and/or removes labels on a message in a single provider call. |
+| `GetAttachmentContent` | Unary | `GetAttachmentContentRequest` | `GetAttachmentContentResponse` | Fetches the raw byte content of a single attachment by message ID and attachment ID. **Note:** gRPC default max message size is 4MB — callers must configure a higher `max_recv_msg_size` on the Rails client for large attachments. |
 
 ### Key Proto Messages
 
 | Message | Fields | Notes |
 |---|---|---|
-| `ProviderCredentials` | `provider` (enum), `access_token` (string) | Passed in every request; service is stateless |
-| `Email` | `id`, `thread_id`, `subject`, `from` (Address), `to` (Address[]), `date` (Timestamp), `snippet`, `body`, `attachments` (Attachment[]), `label_ids` | `body` omitted when `EmailFormat = METADATA` |
+| `ProviderCredentials` | `provider` (enum), `access_token` (string) | Passed in every request; service is stateless. Fan-out RPCs (`ListEmails`, `SearchEmails`) use `repeated ProviderCredentials`; all others use a single field. |
+| `Email` | `id`, `thread_id`, `subject`, `from` (Address), `to` (Address[]), `date` (Timestamp), `snippet`, `body`, `attachments` (Attachment[]), `label_ids`, `provider` (enum) | `body` omitted when `EmailFormat = METADATA`. `provider` field required so Rails can attribute results in fan-out streams. `(provider, id)` is the unique key. For Yahoo IMAP, `thread_id` is synthesised from `In-Reply-To` / `References` headers — best-effort, not guaranteed stable across fetches. |
 | `Address` | `name`, `email` | Structured sender/recipient |
-| `Attachment` | `id`, `filename`, `mime_type`, `size` | Metadata only — content fetched separately |
+| `Attachment` | `id`, `filename`, `mime_type`, `size` | Metadata only — use `GetAttachmentContent` to fetch bytes |
+| `AttachmentContent` | `content` (bytes), `mime_type` (string) | Returned by `GetAttachmentContent`. Callers must configure `max_recv_msg_size` > 4MB on the gRPC client for large attachments. |
 | `Label` | `id`, `name`, `type` (LabelType enum) | `SYSTEM` vs `USER` label types |
-| `PageInfo` | `next_page_token`, `result_count` | Final message in streaming responses |
+| `PageInfo` | `next_page_token`, `result_count` | Final message in streaming responses. For fan-out streams, `next_page_token` is a composite opaque cursor encoding per-provider state (base64 JSON). |
 
 ### Enums
 
@@ -148,9 +150,46 @@ Generated protobuf Go code under `gen/go/email/v1/` is committed to the reposito
 
 Label modification is exposed as a single atomic RPC that accepts both labels to add and labels to remove in one call. Splitting this into two RPCs would require two round trips for a common operation (e.g., marking a message read while archiving it) and would not map cleanly to Gmail's `messages.modify` API, which accepts both `addLabelIds` and `removeLabelIds` in a single call.
 
+### Provider-Specific Label Semantics (Gmail vs Yahoo IMAP)
+
+Gmail labels and IMAP folders have fundamentally different semantics. This is a known constraint — the `ModifyLabels` RPC interface is uniform, but the guarantee it provides differs by provider.
+
+**Gmail:** Labels are many-to-many. A message can simultaneously carry `INBOX`, `IMPORTANT`, and `work`. `ModifyLabels` maps to a single atomic `messages.modify` call.
+
+**Yahoo Mail (IMAP):** Folders are one-to-many. A message lives in exactly one folder at a time. `ModifyLabels` is implemented as COPY + EXPUNGE — the message is copied to the target folder and the original is expunged. This operation is **not atomic**: a crash between COPY and EXPUNGE leaves the message in both folders. Additionally, the message UID changes after the copy, so any UID the Rails caller cached is invalidated.
+
+Rails callers should treat Yahoo label operations as best-effort and re-fetch message state after a `ModifyLabels` call targeting Yahoo. The `Email.id` field returned after a Yahoo `ModifyLabels` reflects the new UID.
+
 ---
 
-## 6. Project Structure
+## 6. Testing Strategy
+
+Three layers, all required in V1.
+
+### Unit tests
+Pure logic with no network or provider calls. Covers:
+- `internal/config` — env-var defaults and overrides
+- `internal/fanout` — concurrent merge logic, partial failure handling, composite cursor encode/decode
+- Any pure helper functions in provider adapters
+
+### Provider adapter tests
+Each adapter tested against deterministic fake responses:
+- **Gmail adapter:** `net/http/httptest` fake server returning recorded Gmail API JSON
+- **Yahoo adapter:** In-process fake IMAP server (via `go-imap`'s test utilities) returning fixture messages
+
+These tests verify that each adapter correctly maps provider responses to the `Email` proto shape, handles auth errors (`UNAUTHENTICATED`), and maps IMAP folders to the `Label` domain type.
+
+### gRPC integration tests
+Full request/response path tested in-process using `google.golang.org/grpc/test/bufconn` (no real network). A fake `Provider` implementation is injected into `EmailServer`. Tests cover:
+- Each RPC happy path (correct response shape)
+- Fan-out across two fake providers (results merged, both providers' emails appear in stream)
+- Partial failure (one fake provider errors, other continues, trailing metadata carries error)
+- Composite cursor round-trip (cursor from page 1 resumes correctly on page 2)
+- `UNAUTHENTICATED` propagation from adapter to gRPC caller
+
+---
+
+## 7. Project Structure
 
 ```
 email-fetcher/
@@ -180,7 +219,7 @@ email-fetcher/
 
 ---
 
-## 7. Tech Stack
+## 8. Tech Stack
 
 | Component | Choice | Rationale |
 |---|---|---|
@@ -189,13 +228,13 @@ email-fetcher/
 | IDL | Protocol Buffers v3 | Language-agnostic schema, backward-compatible evolution, efficient wire format |
 | Code generation | `protoc` + `protoc-gen-go` + `protoc-gen-go-grpc` | Standard toolchain; run via `make proto`, output committed |
 | Gmail integration | Google Gmail REST API v1 (`google.golang.org/api/gmail/v1`) | Official Go client, OAuth2 bearer token auth |
-| Yahoo integration | Yahoo Mail REST API | Direct HTTP calls with `access_token` bearer auth |
+| Yahoo integration | IMAP via `github.com/emersion/go-imap` | Yahoo's REST API is undocumented; IMAP is more battle-tested. OAuth2 via SASL XOAUTH2 using the `access_token` from `ProviderCredentials`. `thread_id` synthesised from `References` / `In-Reply-To` headers. |
 | Configuration | Environment variables via `os.Getenv` / `envconfig` | Twelve-factor; no config files to manage |
 | Rails integration | `grpc` gem (Ruby gRPC client) | Generated from the same `.proto`; strongly typed |
 
 ---
 
-## 8. Deployment
+## 9. Deployment
 
 `email-fetcher` ships as a single statically-linked binary and runs as a process alongside Rails via a `Procfile`:
 
@@ -218,15 +257,17 @@ make build   # produces ./bin/email-fetcher
 | `GRPC_PORT` | `50051` | Port the gRPC server listens on |
 | `LOG_LEVEL` | `info` | Logging verbosity (`debug`, `info`, `warn`, `error`) |
 | `ENV` | `development` | Runtime environment |
+| `SHUTDOWN_TIMEOUT` | `30s` | Grace period for in-flight RPCs on SIGTERM (Go `time.Duration` format, e.g. `30s`, `1m`) |
 
 **Notes:**
 - The binary has no runtime dependencies — no protoc, no shared libraries, no external config files.
 - TLS termination is handled at the load balancer/reverse proxy layer for production. The service accepts plaintext gRPC internally.
 - The `gen/` directory being committed means `go build ./...` works out of the box with no code generation step required in CI.
+- On SIGTERM, the server calls `grpc.Server.GracefulStop()` — stops accepting new connections and waits for active RPCs to complete. After `SHUTDOWN_TIMEOUT`, any remaining RPCs are force-closed. This prevents indefinite hangs during rolling deploys while giving in-flight `ListEmails` / `SearchEmails` streams a reasonable window to drain.
 
 ---
 
-## 9. Future Work / V2 Ideas
+## 10. Future Work / V2 Ideas
 
 ### Interceptor-Based Auth
 
