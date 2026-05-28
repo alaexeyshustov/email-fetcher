@@ -3,6 +3,8 @@ module github.com/alaexeyshustov/email-fetcher
 go 1.25.8
 
 require (
+	github.com/emersion/go-imap v1.2.1
+	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/oauth2 v0.36.0
 	google.golang.org/api v0.282.0
