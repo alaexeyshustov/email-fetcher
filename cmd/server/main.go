@@ -8,7 +8,15 @@ import (
 	"os/signal"
 	"syscall"
 
+	"google.golang.org/grpc"
+
+	emailv1 "github.com/alaexeyshustov/email-fetcher/gen/go/email/v1"
 	"github.com/alaexeyshustov/email-fetcher/internal/config"
+	"github.com/alaexeyshustov/email-fetcher/internal/fanout"
+	providerPkg "github.com/alaexeyshustov/email-fetcher/internal/provider"
+	"github.com/alaexeyshustov/email-fetcher/internal/provider/gmail"
+	"github.com/alaexeyshustov/email-fetcher/internal/provider/yahoo"
+	"github.com/alaexeyshustov/email-fetcher/internal/server"
 )
 
 func main() {
@@ -19,23 +27,42 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	// grpc.NewServer() and EmailServiceServer registration wired here
-	// once proto/email/v1 code generation is complete.
+	providers := map[emailv1.Provider]providerPkg.Provider{
+		emailv1.Provider_GMAIL: gmail.New(),
+		emailv1.Provider_YAHOO: yahoo.New(),
+	}
+
+	srv := grpc.NewServer()
+	emailv1.RegisterEmailServiceServer(srv, server.New(fanout.New(providers)))
 
 	log.Printf("email-fetcher listening on %s (env=%s log=%s)", lis.Addr(), cfg.Env, cfg.LogLevel)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
 
+	go func() {
+		if err := srv.Serve(lis); err != nil {
+			log.Printf("grpc serve: %v", err)
+		}
+	}()
+
+	<-quit
 	log.Printf("email-fetcher shutting down (timeout=%s)", cfg.ShutdownTimeout)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
-	// srv.GracefulStop() blocks until active RPCs complete or ctx expires,
-	// preventing indefinite hangs during rolling deploys.
-	_ = ctx // removed once grpc.Server is wired
+	stopped := make(chan struct{})
+	go func() {
+		srv.GracefulStop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		srv.Stop()
+	}
 
 	log.Println("email-fetcher stopped")
 }
