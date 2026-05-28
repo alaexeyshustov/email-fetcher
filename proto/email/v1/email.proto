@@ -1,0 +1,201 @@
+syntax = "proto3";
+
+package email.v1;
+
+option go_package = "github.com/alaexeyshustov/email-fetcher/gen/go/email/v1;emailv1";
+
+import "google/protobuf/timestamp.proto";
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Provider {
+  PROVIDER_UNSPECIFIED = 0;
+  GMAIL = 1;
+  YAHOO = 2;
+}
+
+enum EmailFormat {
+  EMAIL_FORMAT_UNSPECIFIED = 0;
+  METADATA = 1; // headers + snippet, no body
+  FULL = 2;     // headers + snippet + body + attachments
+  MINIMAL = 3;  // subject + from + date only
+}
+
+enum LabelType {
+  LABEL_TYPE_UNSPECIFIED = 0;
+  SYSTEM = 1; // e.g. INBOX, SENT, TRASH
+  USER = 2;   // user-created labels / IMAP folders
+}
+
+// ─── Shared messages ──────────────────────────────────────────────────────────
+
+// ProviderCredentials carries an OAuth access token for a single provider.
+// Fan-out RPCs (ListEmails, SearchEmails) accept repeated ProviderCredentials;
+// all other RPCs accept a single instance. Tokens are never stored by the service.
+message ProviderCredentials {
+  Provider provider = 1;
+  string access_token = 2;
+}
+
+message Address {
+  string name = 1;
+  string email = 2;
+}
+
+// Attachment carries metadata only. Use GetAttachmentContent to fetch bytes.
+message Attachment {
+  string id = 1;
+  string filename = 2;
+  string mime_type = 3;
+  int64 size = 4;
+}
+
+message AttachmentContent {
+  bytes content = 1;
+  string mime_type = 2;
+}
+
+// Email is the core domain object.
+// The provider field is always populated so Rails can attribute results in
+// fan-out streams where Gmail and Yahoo emails are interleaved.
+// (provider, id) is the unique key for GetEmail and ModifyLabels calls.
+// thread_id is native on Gmail; synthesised from In-Reply-To/References headers on Yahoo.
+message Email {
+  string id = 1;
+  string thread_id = 2;
+  string subject = 3;
+  Address from = 4;
+  repeated Address to = 5;
+  google.protobuf.Timestamp date = 6;
+  string snippet = 7;
+  string body = 8; // omitted when EmailFormat = METADATA or MINIMAL
+  repeated Attachment attachments = 9;
+  repeated string label_ids = 10;
+  Provider provider = 11;
+}
+
+message Label {
+  string id = 1;
+  string name = 2;
+  LabelType type = 3;
+}
+
+// PageInfo is the final message in every streaming response.
+// next_page_token is an opaque composite cursor encoding per-provider pagination
+// state (base64 JSON). Rails round-trips it without inspecting the contents.
+message PageInfo {
+  string next_page_token = 1;
+  int32 result_count = 2;
+}
+
+// ─── ListEmails ───────────────────────────────────────────────────────────────
+
+message ListEmailsRequest {
+  repeated ProviderCredentials credentials = 1;
+  EmailFormat format = 2;
+  int32 max_results = 3;
+  string page_token = 4;
+  repeated string label_ids = 5;
+}
+
+message ListEmailsResponse {
+  oneof payload {
+    Email email = 1;
+    PageInfo page_info = 2;
+  }
+}
+
+// ─── GetEmail ─────────────────────────────────────────────────────────────────
+
+message GetEmailRequest {
+  ProviderCredentials credentials = 1;
+  string id = 2;
+  EmailFormat format = 3;
+}
+
+message GetEmailResponse {
+  Email email = 1;
+}
+
+// ─── SearchEmails ─────────────────────────────────────────────────────────────
+
+message SearchEmailsRequest {
+  repeated ProviderCredentials credentials = 1;
+  string query = 2;
+  EmailFormat format = 3;
+  int32 max_results = 4;
+  string page_token = 5;
+}
+
+message SearchEmailsResponse {
+  oneof payload {
+    Email email = 1;
+    PageInfo page_info = 2;
+  }
+}
+
+// ─── GetLabels ────────────────────────────────────────────────────────────────
+
+message GetLabelsRequest {
+  ProviderCredentials credentials = 1;
+}
+
+message GetLabelsResponse {
+  repeated Label labels = 1;
+}
+
+// ─── GetUnreadCount ───────────────────────────────────────────────────────────
+
+message GetUnreadCountRequest {
+  ProviderCredentials credentials = 1;
+  optional string label_id = 2; // if absent, counts across all labels/folders
+}
+
+message GetUnreadCountResponse {
+  int32 count = 1;
+}
+
+// ─── ModifyLabels ─────────────────────────────────────────────────────────────
+
+// On Gmail: atomic — maps to messages.modify with addLabelIds / removeLabelIds.
+// On Yahoo (IMAP): best-effort COPY + EXPUNGE. Not atomic; message UID changes
+// after the call. Rails must re-fetch message state after a Yahoo ModifyLabels.
+message ModifyLabelsRequest {
+  ProviderCredentials credentials = 1;
+  string message_id = 2;
+  repeated string add_label_ids = 3;
+  repeated string remove_label_ids = 4;
+}
+
+message ModifyLabelsResponse {}
+
+// ─── GetAttachmentContent ─────────────────────────────────────────────────────
+
+// Returns raw attachment bytes. gRPC default max message size is 4 MB — the Rails
+// grpc client must set max_recv_msg_size accordingly for large attachments.
+message GetAttachmentContentRequest {
+  ProviderCredentials credentials = 1;
+  string message_id = 2;
+  string attachment_id = 3;
+}
+
+message GetAttachmentContentResponse {
+  AttachmentContent content = 1;
+}
+
+// ─── Service ──────────────────────────────────────────────────────────────────
+
+service EmailService {
+  // Fan-out: accept repeated ProviderCredentials, merge results across providers.
+  // Partial provider failures surface in trailing metadata (x-failed-providers,
+  // x-provider-errors); the stream continues from healthy providers.
+  rpc ListEmails(ListEmailsRequest) returns (stream ListEmailsResponse);
+  rpc SearchEmails(SearchEmailsRequest) returns (stream SearchEmailsResponse);
+
+  // Single-provider RPCs.
+  rpc GetEmail(GetEmailRequest) returns (GetEmailResponse);
+  rpc GetLabels(GetLabelsRequest) returns (GetLabelsResponse);
+  rpc GetUnreadCount(GetUnreadCountRequest) returns (GetUnreadCountResponse);
+  rpc ModifyLabels(ModifyLabelsRequest) returns (ModifyLabelsResponse);
+  rpc GetAttachmentContent(GetAttachmentContentRequest) returns (GetAttachmentContentResponse);
+}
